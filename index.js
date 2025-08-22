@@ -8,13 +8,20 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const app = express();
 const port = process.env.PORT || 3001;
 
-app.use(cors({
-  origin: [
-    'http://localhost:5173',          // Local development
-    'https://toolsgovt.netlify.app',  // Netlify frontend
-  ],
-}));
-app.use(express.json());
+app.set('trust proxy', 1);
+
+// ---- CORS ----
+// Add any custom domains you use in production here.
+const ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'https://toolsgovt.netlify.app',
+  // 'https://YOUR-CUSTOM-DOMAIN.com',
+];
+app.use(cors({ origin: ALLOWED_ORIGINS }));
+app.use(express.json({ limit: '1mb' }));
+
+// ---- Health check ----
+app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
 // ---- Gemini init ----
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -32,20 +39,56 @@ const noStore = (res) => {
   res.set('Surrogate-Control', 'no-store');
 };
 
+// ---- Helpers for robust JSON from model ----
+function parseModelJson(text) {
+  if (!text || typeof text !== 'string') {
+    throw new Error('Empty model response');
+  }
+
+  // Prefer fenced block if present: ```json ... ``` or ``` ... ```
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  let candidate = fenced ? fenced[1] : text;
+
+  // Normalize smart quotes
+  candidate = candidate
+    .replace(/[\u201C\u201D]/g, '"') // smart double quotes
+    .replace(/[\u2018\u2019]/g, "'"); // smart single quotes
+
+  // Extract the first {...} block
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error('No JSON object found in model output');
+  }
+  let jsonSlice = candidate.slice(start, end + 1);
+
+  // Remove trailing commas like ,}
+  jsonSlice = jsonSlice.replace(/,\s*([}\]])/g, '$1');
+
+  return JSON.parse(jsonSlice);
+}
+
+function coerceAnalysisShape(analysis) {
+  if (typeof analysis !== 'object' || analysis === null) analysis = {};
+  analysis.summary = typeof analysis.summary === 'string' ? analysis.summary : '';
+  analysis.weaknesses = Array.isArray(analysis.weaknesses) ? analysis.weaknesses : [];
+  analysis.suggestions = Array.isArray(analysis.suggestions) ? analysis.suggestions : [];
+  analysis.encouragement = typeof analysis.encouragement === 'string' ? analysis.encouragement : '';
+  return analysis;
+}
+
 // ---- In-memory recent questions store (per subject|topic) ----
-// Map< key, Map<normalizedQuestion, timestamp> >
 const recentQuestions = new Map();
 const RECENT_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const MAX_RECENT_PER_KEY = 250;
 
 const keyFor = (subject, topic) => `${String(subject).trim()}|${String(topic).trim()}`;
-
-// ✅ Fixed regex: removed invalid escapes; placed "-" at end to be literal.
+// Put "-" at end to be literal.
 const STRIP_NUMBERING_RE = /^\s*[-—*•]*\d+[.)।:-]?\s*/u;
 
 const normalizeQ = (s) =>
   String(s)
-    .replace(STRIP_NUMBERING_RE, '') // strip leading numbering/bullets
+    .replace(STRIP_NUMBERING_RE, '')
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -54,9 +97,7 @@ function purgeExpiredForKey(key) {
   if (!bucket) return;
   const now = Date.now();
   for (const [q, ts] of bucket.entries()) {
-    if (now - ts > RECENT_TTL_MS) {
-      bucket.delete(q);
-    }
+    if (now - ts > RECENT_TTL_MS) bucket.delete(q);
   }
 }
 
@@ -111,7 +152,7 @@ function parseQuestionsText(text) {
     .filter((v, i, a) => v && a.indexOf(v) === i);
 }
 
-// Fisher–Yates shuffle for variety
+// Fisher–Yates shuffle
 function shuffleInPlace(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -120,31 +161,21 @@ function shuffleInPlace(arr) {
   return arr;
 }
 
-// ---- Generation configs (tune these for more/less variation) ----
-const genCfgQuestions = {
-  temperature: 1.15,
-  topP: 0.9,
-  topK: 40,
-  maxOutputTokens: 512,
-};
+// ---- Generation configs ----
+const genCfgQuestions = { temperature: 1.15, topP: 0.9, topK: 40, maxOutputTokens: 512 };
+const genCfgQuestionsSpicier = { temperature: 1.35, topP: 0.95, topK: 64, maxOutputTokens: 640 };
+const genCfgFeedback = { temperature: 0.95, topP: 0.9, topK: 40, maxOutputTokens: 2048 };
 
-const genCfgQuestionsSpicier = {
-  temperature: 1.35,
-  topP: 0.95,
-  topK: 64,
-  maxOutputTokens: 640,
-};
+// ---- Models (override via env if needed) ----
+const QUESTIONS_MODEL = process.env.GEMINI_QUESTIONS_MODEL || 'gemini-1.5-flash';
+const FEEDBACK_MODEL  = process.env.GEMINI_FEEDBACK_MODEL  || 'gemini-1.5-flash';
 
-const genCfgFeedback = {
-  temperature: 0.95,
-  topP: 0.9,
-  topK: 40,
-  maxOutputTokens: 2048,
-};
+// =======================================================
+// ==============   HSC/Universal Endpoints   ============
+// =======================================================
 
 /**
- * --- Generate Questions ---
- * Universal for ICT, Chemistry, Physics, etc.
+ * Generate Questions
  */
 app.post('/api/generate-questions', async (req, res) => {
   noStore(res);
@@ -156,7 +187,7 @@ app.post('/api/generate-questions', async (req, res) => {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: QUESTIONS_MODEL });
 
     // Nonce to break determinism/caching
     const nonce = `${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}-${Date.now()}`;
@@ -185,7 +216,7 @@ app.post('/api/generate-questions', async (req, res) => {
     // Filter out recent repeats
     parsed = filterOutRecent(subject, topic, parsed);
 
-    // If not enough, retry once with spicier config
+    // Retry once with spicier config if needed
     if (parsed.length < count) {
       const spicy = await model.generateContent({
         contents: [{ role: 'user', parts: [{ text: basePrompt + '\n\nভ্যারিয়েশন আরেকটু বাড়াও।' }] }],
@@ -206,14 +237,13 @@ app.post('/api/generate-questions', async (req, res) => {
       parsed = merged;
     }
 
-    // If still more than needed, shuffle then slice to increase perceived variety
     shuffleInPlace(parsed);
     if (parsed.length > count) parsed = parsed.slice(0, count);
 
     // Track to recent memory
     rememberQuestions(subject, topic, parsed);
 
-    // Number nicely before sending (clients can also parse lines)
+    // Number before sending
     const numbered = parsed.map((q, i) => `${i + 1}. ${q}`).join('\n');
     res.json({ questionsText: numbered });
   } catch (error) {
@@ -223,8 +253,7 @@ app.post('/api/generate-questions', async (req, res) => {
 });
 
 /**
- * --- Evaluate Multiple Answers ---
- * Universal for ICT, Chemistry, etc.
+ * Evaluate Multiple Answers (free-form feedback text)
  */
 app.post('/api/submit-multiple-answers', async (req, res) => {
   noStore(res);
@@ -237,7 +266,7 @@ app.post('/api/submit-multiple-answers', async (req, res) => {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: FEEDBACK_MODEL });
 
     const toneVariants = [
       'বন্ধুসুলভ এবং আত্মবিশ্বাস বাড়ায় এমন টোন',
@@ -262,7 +291,7 @@ app.post('/api/submit-multiple-answers', async (req, res) => {
 বিষয়: ${subject}
 টপিক: ${topic}
 
-প্রশ্নপত্র ও উত্তর:
+прশ্নপত্র ও উত্তর:
 `.trim();
 
     questions.forEach((question, index) => {
@@ -286,6 +315,90 @@ app.post('/api/submit-multiple-answers', async (req, res) => {
     console.error('Error calling Gemini API for multiple answer feedback:', error?.message || error);
     res.status(500).json({ error: `উত্তর জমা দিতে সমস্যা হয়েছে: ${error?.message || 'Unknown error'}` });
   }
+});
+
+/**
+ * Analyze answers into STRICT JSON (summary/weaknesses/suggestions/encouragement)
+ * This matches your Model_Test / SSC frontends that call /api/analyze-answers.
+ */
+app.post('/api/analyze-answers', async (req, res) => {
+  noStore(res);
+
+  const { subject, chapter, totalQuestions, answeredQuestions, wrongAnswers = [] } = req.body || {};
+  if (!subject || !chapter || totalQuestions === undefined || answeredQuestions === undefined) {
+    return res.status(400).json({ error: 'Subject, chapter, total questions, and answered questions are required.' });
+  }
+
+  const wrongAnswersText = wrongAnswers.map((item, index) => {
+    const userAns = (item && item.selectedIndex !== null && item.selectedIndex !== undefined)
+      ? (item.options?.[item.selectedIndex]?.text ?? 'অজানা অপশন')
+      : 'উত্তর দেননি';
+    const correctAns = item?.options?.[item.correctIndex]?.text ?? 'অজানা সঠিক উত্তর';
+    const exp = item?.explanation || 'কোন ব্যাখ্যা নেই।';
+
+    return `
+${index + 1}. প্রশ্ন: ${item?.questionText ?? '—'}
+আপনার উত্তর: ${userAns}
+সঠিক উত্তর: ${correctAns}
+সঠিক উত্তরের ব্যাখ্যা: ${exp}`;
+  }).join('\n\n');
+
+  const prompt = `
+আপনি একজন অভিজ্ঞ শিক্ষক। একজন শিক্ষার্থীর পরীক্ষার ফলাফলের উপর ভিত্তি করে একটি বিস্তারিত বিশ্লেষণ ও পরামর্শ তৈরি করুন।
+
+পরীক্ষার বিষয়: ${subject}
+অধ্যায়: ${chapter}
+মোট প্রশ্ন: ${totalQuestions}
+উত্তর দেওয়া প্রশ্ন: ${answeredQuestions}
+ভুল উত্তর বা উত্তর না দেওয়া প্রশ্ন: ${wrongAnswers.length}
+
+এখানে যেসব প্রশ্নে ভুল হয়েছে বা উত্তর দেয়া হয়নি:
+${wrongAnswers.length > 0 ? wrongAnswersText : 'শিক্ষার্থী সব প্রশ্নের সঠিক উত্তর দিয়েছে।'}
+
+শুধুমাত্র নিচের কাঠামো অনুযায়ী **খাঁটি JSON** আউটপুট দিন — কোনো অতিরিক্ত টেক্সট/কোডফেন্স নয়:
+
+{
+  "summary": "এই পরীক্ষার সংক্ষিপ্ত সারসংক্ষেপ",
+  "weaknesses": [],
+  "suggestions": [],
+  "encouragement": "শিক্ষার্থীকে উৎসাহিত করার জন্য একটি ছোট বার্তা"
+}
+
+যদি কোনো ভুল উত্তর না থাকে, তবে weaknesses, suggestions অ্যারে খালি রাখবেন।
+`.trim();
+
+  try {
+    const model = genAI.getGenerativeModel({ model: FEEDBACK_MODEL });
+
+    // Ask for application/json; if SDK ignores, we'll still parse robustly.
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }]}],
+      generationConfig: { ...genCfgFeedback, responseMimeType: 'application/json' },
+    });
+
+    const rawText = result?.response?.text?.() ?? '';
+    // Log once to debug server issues (remove if too noisy)
+    console.log('analyze-answers raw:', rawText.slice(0, 400) + (rawText.length > 400 ? ' ...' : ''));
+
+    let analysis;
+    try {
+      analysis = parseModelJson(rawText.trim());
+    } catch (parseErr) {
+      console.error('JSON parse failed. Raw model output:\n', rawText);
+      return res.status(500).json({ error: 'Invalid JSON from Gemini', raw: rawText });
+    }
+
+    analysis = coerceAnalysisShape(analysis);
+    return res.json({ analysis });
+  } catch (error) {
+    console.error('Error calling Gemini API for analysis:', error?.message || error);
+    return res.status(500).json({ error: `বিশ্লেষণ তৈরি করতে সমস্যা হয়েছে: ${error?.message || 'Unknown error'}` });
+  }
+});
+
+// --- Fallback 404 (helps spot wrong paths) ---
+app.use((req, res) => {
+  res.status(404).json({ error: `Route not found: ${req.method} ${req.originalUrl}` });
 });
 
 // --- Start the server ---
