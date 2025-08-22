@@ -1,103 +1,294 @@
-// Server/index.js (এই ফাইলটি আপনার Server GitHub রিপোজিটরির রুটে থাকবে)
-
-require('dotenv').config(); // লোকাল ডেভেলপমেন্টের জন্য
+// index.js
+require('dotenv').config();
 const express = require('express');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cors = require('cors');
+const crypto = require('node:crypto');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
-const port = process.env.PORT || 3001; // লোকাল ডেভেলপমেন্টের জন্য
+const port = process.env.PORT || 3001;
 
-// CORS মিডলওয়্যার সেটআপ
-// এখানে আপনার Netlify ফ্রন্টএন্ডের URL টি যোগ করতে হবে
-// এবং Render থেকে deploy হওয়া ব্যাকএন্ডের URL (যদি আপনি নিজে deploy করেন)
 app.use(cors({
   origin: [
-    'http://localhost:5173', // লোকাল ডেভেলপমেন্টের জন্য
-    'https://toolsgovt.netlify.app', // <-- আপনার Netlify ফ্রন্টএন্ড URL
-  ]
+    'http://localhost:5173',          // Local development
+    'https://toolsgovt.netlify.app',  // Netlify frontend
+  ],
 }));
 app.use(express.json());
 
-// API Key এনভায়রনমেন্ট ভেরিয়েবল থেকে পাবে (লোকালে .env থেকে, Render-এ Render এর কনফিগারেশন থেকে)
+// ---- Gemini init ----
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
-  console.error("Error: GEMINI_API_KEY is not set in environment variables.");
-  // প্রোডাকশন এনভায়রনমেন্টে API Key না থাকলে সার্ভার ত্রুটি দেবে বা বন্ধ হবে
-  process.exit(1); // এই লাইনটি প্রোডাকশনের জন্য ভালো, লোকাল ডেভের জন্য কমেন্ট করে রাখতে পারেন
+  console.error('Error: GEMINI_API_KEY is not set in environment variables.');
+  process.exit(1);
 }
-
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-app.post('/api/generate-application', async (req, res) => {
-  // ফ্রন্টএন্ড থেকে পাঠানো ডেটা রিসিভ করা হচ্ছে
-  const { governmentOfficeName, applicantName, topic, additionalPrompt } = req.body;
+// ---- Utility: response cache control ----
+const noStore = (res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+};
 
-  // ইনপুট ভ্যালিডেশন
-  if (!governmentOfficeName || !applicantName || !topic) {
-    console.log('Validation failed: Missing required fields in request body.', req.body);
-    return res.status(400).json({ error: 'সরকারি অফিসের নাম, আপনার নাম এবং বিষয় উল্লেখ করা আবশ্যক।' });
+// ---- In-memory recent questions store (per subject|topic) ----
+// Map< key, Map<normalizedQuestion, timestamp> >
+const recentQuestions = new Map();
+const RECENT_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const MAX_RECENT_PER_KEY = 250;
+
+const keyFor = (subject, topic) => `${String(subject).trim()}|${String(topic).trim()}`;
+
+// ✅ Fixed regex: removed invalid escapes; placed "-" at end to be literal.
+const STRIP_NUMBERING_RE = /^\s*[-—*•]*\d+[.)।:-]?\s*/u;
+
+const normalizeQ = (s) =>
+  String(s)
+    .replace(STRIP_NUMBERING_RE, '') // strip leading numbering/bullets
+    .replace(/\s+/g, ' ')
+    .trim();
+
+function purgeExpiredForKey(key) {
+  const bucket = recentQuestions.get(key);
+  if (!bucket) return;
+  const now = Date.now();
+  for (const [q, ts] of bucket.entries()) {
+    if (now - ts > RECENT_TTL_MS) {
+      bucket.delete(q);
+    }
+  }
+}
+
+function rememberQuestions(subject, topic, qs) {
+  const key = keyFor(subject, topic);
+  const bucket = recentQuestions.get(key) || new Map();
+  const now = Date.now();
+  purgeExpiredForKey(key);
+
+  for (const q of qs) {
+    const nq = normalizeQ(q);
+    if (!nq) continue;
+    if (bucket.size >= MAX_RECENT_PER_KEY && !bucket.has(nq)) {
+      // drop oldest
+      let oldestKey = null;
+      let oldestTs = Infinity;
+      for (const [qq, ts] of bucket.entries()) {
+        if (ts < oldestTs) { oldestTs = ts; oldestKey = qq; }
+      }
+      if (oldestKey) bucket.delete(oldestKey);
+    }
+    bucket.set(nq, now);
+  }
+  recentQuestions.set(key, bucket);
+}
+
+function filterOutRecent(subject, topic, rawQuestions) {
+  const key = keyFor(subject, topic);
+  purgeExpiredForKey(key);
+  const bucket = recentQuestions.get(key);
+  if (!bucket) return rawQuestions;
+
+  const out = [];
+  const seen = new Set();
+  for (const line of rawQuestions) {
+    const nq = normalizeQ(line);
+    if (!nq || seen.has(nq)) continue;
+    if (!bucket.has(nq)) {
+      out.push(line);
+      seen.add(nq);
+    }
+  }
+  return out;
+}
+
+function parseQuestionsText(text) {
+  return String(text || '')
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => s.replace(STRIP_NUMBERING_RE, '').trim())
+    .filter((v, i, a) => v && a.indexOf(v) === i);
+}
+
+// Fisher–Yates shuffle for variety
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// ---- Generation configs (tune these for more/less variation) ----
+const genCfgQuestions = {
+  temperature: 1.15,
+  topP: 0.9,
+  topK: 40,
+  maxOutputTokens: 512,
+};
+
+const genCfgQuestionsSpicier = {
+  temperature: 1.35,
+  topP: 0.95,
+  topK: 64,
+  maxOutputTokens: 640,
+};
+
+const genCfgFeedback = {
+  temperature: 0.95,
+  topP: 0.9,
+  topK: 40,
+  maxOutputTokens: 2048,
+};
+
+/**
+ * --- Generate Questions ---
+ * Universal for ICT, Chemistry, Physics, etc.
+ */
+app.post('/api/generate-questions', async (req, res) => {
+  noStore(res);
+
+  const { subject, topic, studentName, count } = req.body;
+  if (!subject || !topic || !studentName || !count) {
+    console.log('Validation failed: Missing required fields for questions.', req.body);
+    return res.status(400).json({ error: 'বিষয়, টপিক, শিক্ষার্থীর নাম এবং প্রশ্নের সংখ্যা উল্লেখ করা আবশ্যক।' });
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
-    // বাংলাদেশ সময় (ঢাকা) অনুযায়ী বর্তমান তারিখ ও সময়
-    const bangladeshTimeZone = 'Asia/Dhaka';
-    const optionsDate = { day: 'numeric', month: 'long', year: 'numeric', timeZone: bangladeshTimeZone };
-    const optionsTime = { hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: true, timeZone: bangladeshTimeZone };
-    const currentDate = new Date().toLocaleDateString('bn-BD', optionsDate);
-    const currentTime = new Date().toLocaleTimeString('bn-BD', optionsTime);
+    // Nonce to break determinism/caching
+    const nonce = `${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}-${Date.now()}`;
 
-    // প্রম্পট তৈরি করা হচ্ছে
-    const prompt = `
-      বর্তমান তারিখ ও সময় (বাংলাদেশ): ${currentDate}, ${currentTime}।
-      বাংলায় একটি অফিসিয়াল সরকারি আবেদন পত্র লিখুন।
+    const basePrompt = `
+তুমি একজন অভিজ্ঞ ও ভদ্র শিক্ষক।
+"${subject}" বিষয়ের "${topic}" টপিক থেকে ${count}টি সংক্ষিপ্ত, স্পষ্ট এবং একে-অপরের থেকে ভিন্ন প্রশ্ন তৈরি করো।
+- প্রশ্নগুলো হবে জ্ঞানভিত্তিক, সরাসরি, এবং পুনরাবৃত্তিহীন।
+- ছোট/একলাইনি প্রশ্নও রাখতে পারো, তবে অর্থবহ হতে হবে।
+- একই ধারণা একাধিকভাবে যেন না আসে।
+- প্রতিটি প্রশ্ন নতুন লাইনে সিরিয়াল লিখতে পারো, তবে উত্তর দেবে না।
+- ভাষা মানবিক ও সহমর্মী হওয়া চাই।
+- প্রশ্নগুলো HSC/কলেজ-লেভেল ধরেই করো।
 
-      আবেদনপত্রের প্রাপক: ${governmentOfficeName}
-      আবেদনকারীর নাম: ${applicantName}
-      আবেদনের বিষয়: ${topic}
-      ${additionalPrompt ? `আবেদনপত্রের বডিতে এই অতিরিক্ত তথ্যগুলো যোগ করুন: "${additionalPrompt}"` : ''}
+র‍্যান্ডম টোকেন (ভ্যারিয়েশন নিশ্চিত করতে): ${nonce}
+    `.trim();
 
-      আবেদনপত্রের কাঠামো নিম্নরূপ হবে এবং বাংলাদেশের সরকারি অফিসিয়াল আবেদনের রীতি কঠোরভাবে অনুসরণ করবে:
+    // First try
+    const first = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: basePrompt }] }],
+      generationConfig: genCfgQuestions,
+    });
+    const firstText = (await first.response).text();
+    let parsed = parseQuestionsText(firstText);
 
-      তারিখ: ${currentDate}
+    // Filter out recent repeats
+    parsed = filterOutRecent(subject, topic, parsed);
 
-      বরাবর,
-      ${governmentOfficeName}
-      [এখানে অফিসের একটি জেনেরিক ঠিকানা যোগ করুন, যেমন: সিলেট, বাংলাদেশ]
+    // If not enough, retry once with spicier config
+    if (parsed.length < count) {
+      const spicy = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: basePrompt + '\n\nভ্যারিয়েশন আরেকটু বাড়াও।' }] }],
+        generationConfig: genCfgQuestionsSpicier,
+      });
+      const spicyText = (await spicy.response).text();
+      const parsed2 = filterOutRecent(subject, topic, parseQuestionsText(spicyText));
 
-      বিষয়: ${topic}
+      // Merge unique
+      const merged = [];
+      const seen = new Set(parsed.map(normalizeQ));
+      for (const q of [...parsed, ...parsed2]) {
+        const nq = normalizeQ(q);
+        if (!nq || seen.has(nq)) continue;
+        merged.push(q);
+        seen.add(nq);
+      }
+      parsed = merged;
+    }
 
-      জনাব,
+    // If still more than needed, shuffle then slice to increase perceived variety
+    shuffleInPlace(parsed);
+    if (parsed.length > count) parsed = parsed.slice(0, count);
 
-      সবিনয় নিবেদন এই যে, [এখানে "${topic}" এর উপর ভিত্তি করে আবেদনপত্রের মূল বডি লিখুন। "${additionalPrompt}" যদি দেওয়া থাকে, তবে সেটি প্রাসঙ্গিকভাবে বডিতে অন্তর্ভুক্ত করুন। আবেদনপত্রের উদ্দেশ্য স্পষ্ট করুন এবং সংক্ষিপ্ত রাখুন। বাংলাদেশের অফিসিয়াল ভাষা ও বিনয় ব্যবহার করুন]।
+    // Track to recent memory
+    rememberQuestions(subject, topic, parsed);
 
-      অতএব, জনাবের নিকট বিনীত প্রার্থনা এই যে, [এখানে "${topic}" এর উপর ভিত্তি করে সুনির্দিষ্ট অনুরোধটি স্পষ্টভাবে উল্লেখ করুন এবং প্রয়োজনীয় পদক্ষেপের জন্য প্রার্থনা করুন]।
-
-      বিনীত নিবেদক,
-      ${applicantName}
-      [আপনার স্বাক্ষর]
-      [আপনার পদবি, যদি প্রযোজ্য হয়]
-      [আপনার ফোন নম্বর, যদি প্রযোজ্য হয়]
-      [আপনার ইমেইল, যদি প্রযোজ্য হয়]
-
-      অনুগ্রহ করে শুধুমাত্র আবেদন পত্রের সম্পূর্ণ টেক্সট দিন, অন্য কোন অতিরিক্ত কথা নয়। ফরম্যাটটি কঠোরভাবে অনুসরণ করুন।
-    `;
-
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
-
-    res.json({ applicationText: text });
-
+    // Number nicely before sending (clients can also parse lines)
+    const numbered = parsed.map((q, i) => `${i + 1}. ${q}`).join('\n');
+    res.json({ questionsText: numbered });
   } catch (error) {
-    console.error('Error calling Gemini API:', error.message);
-    res.status(500).json({ error: `অ্যাপ্লিকেশন তৈরি করতে সমস্যা হয়েছে: ${error.message}` });
+    console.error('Error calling Gemini API for questions:', error?.message || error);
+    res.status(500).json({ error: `প্রশ্ন তৈরি করতে সমস্যা হয়েছে: ${error?.message || 'Unknown error'}` });
   }
 });
 
-// লোকাল ডেভেলপমেন্টের জন্য সার্ভার চালু করে
+/**
+ * --- Evaluate Multiple Answers ---
+ * Universal for ICT, Chemistry, etc.
+ */
+app.post('/api/submit-multiple-answers', async (req, res) => {
+  noStore(res);
+
+  const { studentName, subject, topic, questions, answers } = req.body;
+
+  if (!studentName || !subject || !topic || !Array.isArray(questions) || typeof answers !== 'object' || Object.keys(answers).length === 0) {
+    console.log('Validation failed: Missing or invalid fields for multiple answers submission.', req.body);
+    return res.status(400).json({ error: 'শিক্ষার্থীর নাম, বিষয়, টপিক, প্রশ্নপত্র এবং উত্তরগুলো আবশ্যক।' });
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+    const toneVariants = [
+      'বন্ধুসুলভ এবং আত্মবিশ্বাস বাড়ায় এমন টোন',
+      'শিক্ষকসুলভ কিন্তু উৎসাহব্যঞ্জক টোন',
+      'খুবই নরম ও সহানুভূতিশীল টোন',
+      'পরামর্শমূলক ও উদাহরণ-ভিত্তিক টোন',
+      'সংক্ষিপ্ত কিন্তু কার্যকরী সুপারিশ–ভিত্তিক টোন'
+    ];
+    const tone = toneVariants[Math.floor(Math.random() * toneVariants.length)];
+    const nonce = `${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}-${Date.now()}`;
+
+    let evaluationPrompt = `
+তুমি একজন অভিজ্ঞ ও ভদ্র শিক্ষক।
+শিক্ষার্থীর উত্তরগুলো বাংলায় ${tone}-এ মূল্যায়ন করো।
+- প্রতিটি প্রশ্নের উত্তর আলাদা করে ছোট ছোট প্যারায় ফিডব্যাক দাও।
+- যেখানেই প্রয়োজন, ১–২ লাইনের ছোট উদাহরণ দাও।
+- ভুল/আধাভুল হলে কীভাবে ঠিক করা যায় — ২–৩টি বুলেট পয়েন্টে বলো।
+- শেষে সামগ্রিক মন্তব্য এবং একটি গ্রেড দাও (চমৎকার/ভালো/উন্নতির প্রয়োজন)।
+র‍্যান্ডম টোকেন: ${nonce}
+
+শিক্ষার্থীর নাম: ${studentName}
+বিষয়: ${subject}
+টপিক: ${topic}
+
+প্রশ্নপত্র ও উত্তর:
+`.trim();
+
+    questions.forEach((question, index) => {
+      const studentAnswer = answers[index] || 'কোনো উত্তর দেওয়া হয়নি।';
+      evaluationPrompt += `
+প্রশ্ন ${index + 1}: ${question}
+শিক্ষার্থীর উত্তর: ${studentAnswer}
+--------------------
+`;
+    });
+
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: evaluationPrompt }] }],
+      generationConfig: genCfgFeedback,
+    });
+    const response = await result.response;
+    const text = response.text();
+
+    res.json({ feedbackText: text });
+  } catch (error) {
+    console.error('Error calling Gemini API for multiple answer feedback:', error?.message || error);
+    res.status(500).json({ error: `উত্তর জমা দিতে সমস্যা হয়েছে: ${error?.message || 'Unknown error'}` });
+  }
+});
+
+// --- Start the server ---
 app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
