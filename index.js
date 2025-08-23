@@ -15,7 +15,7 @@ app.set('trust proxy', 1);
 const ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'https://toolsgovt.netlify.app',
-  'https://smartprostuti.netlify.app',
+  'https://smartprostuti.netlify.app'
   // 'https://YOUR-CUSTOM-DOMAIN.com',
 ];
 app.use(cors({ origin: ALLOWED_ORIGINS }));
@@ -406,4 +406,5 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
+
 
